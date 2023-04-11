@@ -1,0 +1,137 @@
+import numpy as np
+from tqdm import tqdm, trange
+import math
+from flearn.utils.model_utils import Metrics
+import tensorflow as tf
+
+from .fedbase import BaseFedarated
+from flearn.utils.tf_utils import process_grad
+from flearn.utils.utils import clip, sparsify, topindex, transform
+from flearn.utils.privacy_utils import clip_randomizer_clipLap, sampling_randomizer, clip_randomizer, set_grad_noise
+from tensorflow.python.training.gradient_descent import GradientDescentOptimizer
+from tensorflow.python.training.adam import AdamOptimizer
+from flearn.optimizers.pgd import PerturbedGradientDescent
+from tensorflow_privacy.privacy.optimizers import dp_optimizer
+from tensorflow_privacy.privacy.analysis.rdp_accountant import compute_rdp
+from tensorflow_privacy.privacy.analysis.rdp_accountant import get_privacy_spent
+
+class Server(BaseFedarated):
+    '''
+    traditional LDP-FL
+    1. sampling depends on self.rate
+    2. gaussian distribution for (epsilon, delta_lk)-LDP(DP) privacy
+    '''
+    def __init__(self, params, learner, dataset):
+        print('Using Federated prox to Train (unified eps LDP-FL)')
+        # self.inner_opt = GradientDescentOptimizer(learning_rate=params['learning_rate'])
+        # self.inner_opt = AdamOptimizer(learning_rate=params['learning_rate'])
+        # self.inner_opt = PerturbedGradientDescent(learning_rate=params['learning_rate'], mu=params['mu'])
+
+        for key, val in params.items():
+            setattr(self, key, val)
+        users, _, train_data, _ = dataset
+        self.num_samples = math.floor(len(train_data[users[0]]['x']) // params['batch_size']) * params['batch_size']
+        
+        # calculate noise by set eps
+        self.noise_multiplier,_,_ = set_grad_noise(norm = self.norm, batch_size = self.batch_size, epochs = self.num_epochs, num_samples = self.num_samples, eps = self.epsilon, delta = self.delta)
+        
+        # acutual eps with noises
+        self.epsilon = self.setup_privacy()  # TODO(check): for each local optimization
+        print("({}, {})-DP privacy for once local optimization.".format(self.epsilon , self.delta))
+        
+        self.inner_opt = dp_optimizer.DPAdamGaussianOptimizer(l2_norm_clip=self.norm,
+                                                    noise_multiplier=self.noise_multiplier,
+                                                    num_microbatches=self.num_epochs,
+                                                    learning_rate=self.learning_rate)
+        # create worker nodes
+        tf.reset_default_graph()
+        self.client_model = learner(
+            *params['model_params'], self.inner_opt, self.seed)
+        self.clients = self.setup_clients(dataset, self.dataset, self.model,
+                                          self.client_model)
+        print('{} Clients in Total'.format(len(self.clients)))
+        self.latest_model = self.client_model.get_params() # global model params
+
+        self.dim_model, self.dim_x, self.dim_y = self.setup_dim(
+            self.dataset, self.model)
+
+
+        self.clip_C = self.norm
+        # initialize system metrics
+        self.metrics = Metrics(self.clients, params)
+        self.test_acc_list = []
+
+    def train(self):
+        '''Train using Federated Proximal'''
+        self.train_grouping()
+
+    def local_process(self, flattened, eps):
+        # choices = topindex(flattened, self.topk)
+        # self.choice_list.extend(choices)
+        # return sampling_randomizer(flattened, choices, self.clip_C, self.eps_ld, self.delta, self.mechanism)       
+        # TODO clip and add noises
+        return flattened
+
+    def server_process(self, messages):
+        '''
+        basic aggregate, scale with rate when Top-k is applied (when rate > 1)
+        '''
+        total_weight, base = self.aggregate_e(messages)
+        # return self.average_cali(total_weight/self.rate, base, self.clip_C) #calibrate
+        # return self.aggregate_p(messages)
+        return self.average(total_weight/self.rate, base) # without scale
+    
+    def local_process(self, flattened, eps):
+        return clip_randomizer(flattened, self.clip_C, self.epsilon, self.delta, self.mechanism)
+    
+    def set_epsilon(self, epsilon, s_n, u):
+        if self.pad_mod == 'on':
+            eps_num = self.pad_sample
+        else:
+            eps_num = s_n
+        # uniform distribution eps
+        if self.eps_dist == 'single':
+            eps = [epsilon] * eps_num
+        elif self.eps_dist == 'uniform':
+            left = self.per_left
+            right = self.per_right
+            eps = np.random.uniform(left , right, eps_num)
+            eps = eps.tolist()
+        # normal distribution eps
+        elif self.eps_dist == 'normal':
+            eps = np.random.normal(self.per_mean, self.per_sigma, eps_num)
+            eps = np.maximum(np.array(0.01), eps)
+            eps = eps.tolist()
+        elif self.eps_dist == 'step':
+            if int(u.split('_')[1]) % 100 < 90:
+                eps = [self.per_left] * eps_num
+            else:
+                eps = [self.per_right] * eps_num
+        elif self.eps_dist == 'uni_thre':
+            left = self.per_left
+            right = self.per_right
+            eps = np.random.uniform(left , right, eps_num)
+            for i in range(len(eps)):
+                if eps[i] > self.eps_thre:
+                    eps[i] = self.eps_thre
+        return eps
+    
+    
+    def setup_privacy(self):
+        # privacy acounting
+        orders = [1 + x / 10. for x in range(1, 100)] + list(range(12, 64))
+        # sampling_probability = self.batch_size / self.num_samples
+        sampling_probability = 1
+        steps = self.num_epochs * self.num_samples // self.batch_size
+        rdp = compute_rdp(q=sampling_probability,
+                        noise_multiplier=self.noise_multiplier,
+                        steps=steps,
+                        orders=orders)
+        epsilon = get_privacy_spent(orders, rdp, target_delta=1e-5)[0]
+        print("------------------------------------------------")
+        print("{}*{}/{} steps, with ({}, {})-DP".format(self.num_epochs, 
+                                                        self.batch_size, 
+                                                        self.num_samples,
+                                                        epsilon,
+                                                        self.delta))
+        return epsilon
